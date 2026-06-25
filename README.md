@@ -35,21 +35,33 @@ and extensible `PS1` without the bloat.
 ### One-line install
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/beratiyilik/bashify/main/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/beratiyilik/bashify/HEAD/install.sh)"
 ```
 
-This clones bashify into `~/.bashify` and appends a `source` line to your
+The `HEAD` in the URL always fetches the latest installer. It then installs the
+**latest stable release tag** when one exists, and falls back to the default
+branch (`main`) until the first release is tagged. There is no commit/branch
+pinning by design — to install from a mirror or fork, override the source repo
+with `BASHIFY_REPO`.
+
+The installer clones bashify into `~/.bashify` and appends a `source` line to your
 `~/.bashrc`. Restart your shell or run `source ~/.bashrc` to apply.
 
 The installer also seeds a starter config at
 `~/.config/bashify/bashifyrc` (it won't overwrite an existing one).
 
-Override the install location or rc file with environment variables:
+Override the install location, rc file, or source repo with environment variables:
 
 ```bash
 BASHIFY_DIR=~/.local/share/bashify RC_FILE=~/.bash_profile \
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/beratiyilik/bashify/main/install.sh)"
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/beratiyilik/bashify/HEAD/install.sh)"
 ```
+
+| Variable       | Default                              | Purpose                               |
+| -------------- | ------------------------------------ | ------------------------------------- |
+| `BASHIFY_DIR`  | `~/.bashify`                         | install location for the remote fetch |
+| `RC_FILE`      | `~/.bashrc`                          | rc file to append the `source` line   |
+| `BASHIFY_REPO` | `github.com/beratiyilik/bashify.git` | source repo to clone (mirror/fork)    |
 
 ### From a clone
 

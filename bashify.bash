@@ -174,12 +174,6 @@ if [[ -z "${BASHIFY_USER_CONFIG:-}" ]]; then
 fi
 [[ -f "$BASHIFY_USER_CONFIG" ]] && source "$BASHIFY_USER_CONFIG"
 
-# automatically disable right prompt inside Docker containers and dumb terminals;
-# can be overridden by setting BASHIFY_RIGHT_PROMPT_ENABLED=true in your bashifyrc
-if [[ -f /.dockerenv || "$TERM" == "dumb" ]]; then
-  BASHIFY_RIGHT_PROMPT_ENABLED=false
-fi
-
 #############################################################################
 # MODULES FUNCTIONS
 #############################################################################
@@ -345,8 +339,47 @@ get_dir_segment() {
   printf "%s" "${BASHIFY_DIR_COLOR}$dir${BASHIFY_STYLE_RESET} "
 }
 
-# git module - with performance caching, uses existing __git_ps1 if available
+# git module - branch + status, cached for BASHIFY_GIT_CACHE_TIMEOUT seconds.
+#
+# The heavy work lives in _bashify_git_cache_refresh, which set_bashify_prompt
+# calls DIRECTLY (not in a command substitution). That matters: the prompt loop
+# captures each segment via "$(get_x_segment)", i.e. a subshell, whose variable
+# writes never reach the parent. So the cache is populated from the main shell
+# here, and get_git_segment is just a thin reader of the cached value (a subshell
+# inherits the parent's variables for reading). Without this, the cache could
+# never survive to the next prompt and every prompt forked ~7 git processes.
+#
+# Cache state persists across prompts (intentionally not 'local').
+_BASHIFY_GIT_CACHE_KEY=""
+_BASHIFY_GIT_CACHE_TS=0
+_BASHIFY_GIT_CACHE_VAL=""
+
+# print the cached git segment; refresh first if we've changed directories
+# (safety net for direct calls — the prompt builder normally refreshes upfront).
 get_git_segment() {
+  [[ "$PWD" != "$_BASHIFY_GIT_CACHE_KEY" ]] && _bashify_git_cache_refresh
+  printf "%s" "$_BASHIFY_GIT_CACHE_VAL"
+}
+
+# recompute the git segment into the cache when stale or the directory changed.
+_bashify_git_cache_refresh() {
+
+  # bail out cheaply while the previous render is still fresh and we are in the
+  # same directory — this is the BASHIFY_GIT_CACHE_TIMEOUT the config advertises.
+  local _now ttl
+  _now=$(_bashify_now)
+  ttl="${BASHIFY_GIT_CACHE_TIMEOUT:-3}"
+  if [[ "$PWD" == "$_BASHIFY_GIT_CACHE_KEY" ]] && ((_now - _BASHIFY_GIT_CACHE_TS < ttl)); then
+    return
+  fi
+
+  # helper: record this render in the cache, keyed by the current directory.
+  # an empty value is cached too, so non-repo dirs skip the repo check next time.
+  _git_cache_store() {
+    _BASHIFY_GIT_CACHE_KEY="$PWD"
+    _BASHIFY_GIT_CACHE_TS="$_now"
+    _BASHIFY_GIT_CACHE_VAL="$1"
+  }
 
   # helper function: check if git command is available and we're in a git repository
   _git_is_repo() {
@@ -359,7 +392,7 @@ get_git_segment() {
     git symbolic-ref --short HEAD 2>/dev/null || git describe --tags --always 2>/dev/null
   }
 
-  # helper function: get git status output (cached for performance)
+  # helper function: get git status output (single porcelain pass)
   _git_status_output() {
     git status --porcelain 2>/dev/null
   }
@@ -521,18 +554,19 @@ get_git_segment() {
 
   # check if we're in a git repository
   if ! _git_is_repo; then
+    _git_cache_store ""
     return
   fi
 
   # get current branch name
   local branch
   branch=$(_git_branch_name)
-  [[ -z "$branch" ]] && return
+  [[ -z "$branch" ]] && { _git_cache_store ""; return; }
 
   # start with branch name
   local git_info="${BASHIFY_STYLE_BOLD}${BASHIFY_GIT_COLOR_BRANCH}${BASHIFY_GIT_ICON_BRANCH}${branch}${BASHIFY_STYLE_RESET}"
 
-  # get status info efficiently (cached for performance)
+  # get status info (the whole segment is cached by the caller)
   local status_output
   status_output=$(_git_status_output)
 
@@ -566,7 +600,7 @@ get_git_segment() {
     git_info+="$(_git_format_conflict_indicator "$has_conflicts")"
   fi
 
-  printf "%s" "$git_info "
+  _git_cache_store "$git_info "
 }
 
 # prompt_char module - shows a character based on the last command's success
@@ -609,7 +643,6 @@ get_node_segment() {
   local active_version=""
   local required_version=""
   local result=""
-  local check=""
   local color="${BASHIFY_NODE_COLOR}"
   local icon="${BASHIFY_NODE_ICON}"
 
@@ -634,14 +667,11 @@ get_node_segment() {
       fi
     fi
 
-    # check compatibility only if required_version is valid
-    if [[ -n "$required_version" && -n "$(command -v npx)" ]]; then
-      check=$(npx --yes semver "$active_version" -r "$required_version" 2>/dev/null)
-
-      if [[ -z "$check" ]]; then
-        color="${BASHIFY_FG_YELLOW}"
-        icon="${BASHIFY_GIT_ICON_WARNING}"
-      fi
+    # check compatibility against engines.node — pure bash, no npx/subprocess.
+    # only warns on a confidently-detected mismatch; unparseable ranges pass.
+    if [[ -n "$required_version" ]] && ! _bashify_semver_satisfies "$required_version" "$active_version"; then
+      color="${BASHIFY_FG_YELLOW}"
+      icon="${BASHIFY_GIT_ICON_WARNING}"
     fi
 
     result="${color}${icon} ${short_version}"
@@ -677,6 +707,127 @@ get_time_segment() {
 #############################################################################
 # HELPER FUNCTIONS
 #############################################################################
+
+# seconds since the epoch, preferring sources that do NOT fork a subprocess
+# ($EPOCHSECONDS on bash 5+, printf %()T on 4.2+), falling back to date(1).
+_bashify_now() {
+  if [[ -n "${EPOCHSECONDS:-}" ]]; then
+    printf "%s" "$EPOCHSECONDS"
+  else
+    printf "%(%s)T" -1 2>/dev/null || date +%s
+  fi
+}
+
+# compare two dotted numeric versions; print -1 / 0 / 1 for a<b / a==b / a>b.
+# build metadata and pre-release suffixes are ignored; missing parts read as 0.
+_bashify_vercmp() {
+  local -a av bv
+  IFS='.' read -ra av <<<"${1%%[+-]*}"
+  IFS='.' read -ra bv <<<"${2%%[+-]*}"
+  local i max=${#av[@]} x y
+  ((${#bv[@]} > max)) && max=${#bv[@]}
+  for ((i = 0; i < max; i++)); do
+    x=${av[i]:-0}; x=${x%%[!0-9]*}; x=${x:-0}
+    y=${bv[i]:-0}; y=${y%%[!0-9]*}; y=${y:-0}
+    ((10#$x > 10#$y)) && { printf -- "1"; return; }
+    ((10#$x < 10#$y)) && { printf -- "-1"; return; }
+  done
+  printf -- "0"
+}
+
+# does concrete version $2 satisfy a SINGLE comparator token $1?
+# prints "yes", "no", or "unknown" (unparseable — callers treat it as a pass).
+_bashify_semver_one() {
+  local tok="$1" ver="$2" op="="
+  [[ -z "$tok" || "$tok" == "*" || "$tok" == [xX] ]] && { printf "yes"; return; }
+  case "$tok" in
+    ">="*) op=">="; tok=${tok#>=} ;;
+    "<="*) op="<="; tok=${tok#<=} ;;
+    ">"*)  op=">";  tok=${tok#>}  ;;
+    "<"*)  op="<";  tok=${tok#<}  ;;
+    "="*)  op="=";  tok=${tok#=}  ;;
+    "^"*)  op="^";  tok=${tok#^}  ;;
+    "~"*)  op="~";  tok=${tok#"~"} ;;
+    v*)    tok=${tok#v} ;;
+  esac
+
+  local -a p
+  IFS='.' read -ra p <<<"$tok"
+  local M=${p[0]:-x} m=${p[1]:-x} pa=${p[2]:-x} mWild=0 pWild=0
+  [[ "$M" == [xX*] ]] && { printf "yes"; return; }          # any major
+  [[ "$M" =~ ^[0-9]+$ ]] || { printf "unknown"; return; }
+  [[ "$m"  =~ ^[0-9]+$ ]] || { mWild=1; m=0; }
+  [[ "$pa" =~ ^[0-9]+$ ]] || { pWild=1; pa=0; }
+
+  # explicit comparators treat missing parts as 0 and compare directly
+  case "$op" in
+  ">="|">"|"<="|"<")
+    local c; c=$(_bashify_vercmp "$ver" "$M.$m.$pa")
+    case "$op" in
+    ">=") [[ "$c" != -1 ]] && printf "yes" || printf "no" ;;
+    ">")  [[ "$c" == 1  ]] && printf "yes" || printf "no" ;;
+    "<=") [[ "$c" != 1  ]] && printf "yes" || printf "no" ;;
+    "<")  [[ "$c" == -1 ]] && printf "yes" || printf "no" ;;
+    esac
+    return
+    ;;
+  esac
+
+  # range operators (^, ~, =, x-ranges) expand to [low, high) — high exclusive
+  local low high
+  case "$op" in
+  "^")
+    low="$M.$m.$pa"
+    if   ((M > 0)); then high="$((M + 1)).0.0"
+    elif ((m > 0)); then high="0.$((m + 1)).0"
+    else                 high="0.0.$((pa + 1))"; fi
+    ;;
+  "~")
+    low="$M.$m.$pa"
+    if ((mWild)); then high="$((M + 1)).0.0"; else high="$M.$((m + 1)).0"; fi
+    ;;
+  *) # "=" or bare: a full version is exact, a partial is an x-range
+    if   ((mWild)); then low="$M.0.0";   high="$((M + 1)).0.0"
+    elif ((pWild)); then low="$M.$m.0";  high="$M.$((m + 1)).0"
+    else
+      [[ "$(_bashify_vercmp "$ver" "$M.$m.$pa")" == 0 ]] && printf "yes" || printf "no"
+      return
+    fi
+    ;;
+  esac
+
+  if [[ "$(_bashify_vercmp "$ver" "$low")" != -1 && "$(_bashify_vercmp "$ver" "$high")" == -1 ]]; then
+    printf "yes"
+  else
+    printf "no"
+  fi
+}
+
+# does concrete version $2 satisfy the range expression $1 (e.g. ">=18 <21",
+# "^18 || ^20", "18.x")? returns 0 when satisfied AND when the range can't be
+# parsed (fail-open: never raise a false warning); returns 1 only on a confident
+# miss. pure bash — replaces the per-prompt `npx --yes semver` subprocess.
+_bashify_semver_satisfies() {
+  local range="$1" ver="$2" group tok res ok
+  local -a orgroups comps
+  range=${range//||/$'\x01'} # split OR groups on a sentinel
+  IFS=$'\x01' read -ra orgroups <<<"$range"
+  for group in "${orgroups[@]}"; do
+    # hyphen range "A - B" is shorthand for ">=A <=B"
+    if [[ "$group" == *" - "* ]]; then
+      group=">=${group%% - *} <=${group##* - }"
+    fi
+    read -ra comps <<<"$group"
+    ((${#comps[@]} == 0)) && return 0 # empty group matches anything
+    ok=1
+    for tok in "${comps[@]}"; do
+      res=$(_bashify_semver_one "$tok" "$ver")
+      [[ "$res" == "no" ]] && { ok=0; break; } # "unknown" is skipped (pass)
+    done
+    ((ok)) && return 0
+  done
+  return 1
+}
 
 # get the short hostname - truncate to 12 chars if needed
 _bashify_get_short_hostname() {
@@ -727,6 +878,13 @@ _bashify_handle_resize() {
 # main prompt builder - uses spaces to position right-side elements
 set_bashify_prompt() {
   local last_exit_code=$? # get last command exit code
+
+  # refresh the git cache from the main shell (TTL-gated, cheap on a hit) so its
+  # result survives to the next prompt — the per-segment "$(...)" calls below run
+  # in subshells and cannot persist state. only bother if git is actually shown.
+  if [[ " ${BASHIFY_LEFT_PROMPT_ELEMENTS[*]} ${BASHIFY_RIGHT_PROMPT_ELEMENTS[*]} " == *" git "* ]]; then
+    _bashify_git_cache_refresh
+  fi
 
   # build left side of the prompt
   local prompt_left
