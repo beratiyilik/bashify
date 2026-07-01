@@ -461,8 +461,10 @@ _bashify_git_cache_refresh() {
       indicators+=" ${BASHIFY_GIT_COLOR_UNTRACKED}${BASHIFY_GIT_ICON_UNTRACKED}${untracked}${BASHIFY_STYLE_RESET}"
     fi
 
-    # check if working directory is clean - only when nothing else, including conflicts, is set
-    if [[ "$staged" -eq 0 && "$modified" -eq 0 && "$untracked" -eq 0 && "$conflicted" -eq 0 ]]; then
+    # check if working directory is clean - only when nothing else, including conflicts, is set.
+    # skip entirely when the icon is empty so no stray separator space is left dangling
+    # (it would otherwise stack with the cache's own trailing space in get_git_segment).
+    if [[ "$staged" -eq 0 && "$modified" -eq 0 && "$untracked" -eq 0 && "$conflicted" -eq 0 && -n "$BASHIFY_GIT_ICON_CHECK" ]]; then
       indicators+=" ${BASHIFY_GIT_COLOR_CLEAN}${BASHIFY_GIT_ICON_CHECK}${BASHIFY_STYLE_RESET}"
     fi
 
@@ -638,8 +640,26 @@ get_jobs_segment() {
   fi
 }
 
+# true if PWD (or an ancestor, up to $HOME or /) contains a Node.js project marker.
+# gates get_node_segment so it doesn't show up in every directory just because a
+# node binary happens to be on PATH.
+_bashify_is_node_project() {
+  local dir="$PWD"
+  local -a markers=(package.json .nvmrc .node-version node_modules yarn.lock pnpm-lock.yaml package-lock.json)
+  local marker
+  while :; do
+    for marker in "${markers[@]}"; do
+      [[ -e "$dir/$marker" ]] && return 0
+    done
+    [[ "$dir" == "/" || "$dir" == "$HOME" ]] && return 1
+    dir="$(dirname "$dir")"
+  done
+}
+
 # node module - shows if in a nodejs project
 get_node_segment() {
+  _bashify_is_node_project || return
+
   local active_version=""
   local required_version=""
   local result=""
